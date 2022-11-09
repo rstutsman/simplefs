@@ -9,6 +9,24 @@
 #include "bitmap.h"
 #include "simplefs.h"
 
+static void simplefs_fixup_radix_tree_with_blkid(struct address_space *mapping,
+                                                 int bno)
+{
+    // Modeled after migrate_page_move_mapping() in mm/migrate.c
+    struct page *blkid;
+    void **pslot;
+
+    spin_lock_irq(&mapping->tree_lock);
+
+    pslot = radix_tree_lookup_slot(&mapping->page_tree, page_index(page));
+    // XXX probably can't spin here, but not sure of way to block
+    while (radix_tree_deref_slot_protected(pslot, &mapping->tree_lock) != page);
+
+    radix_tree_replace_slot(&mapping->page_tree, pslot, blkid);
+
+    spin_unlock(&mapping->tree_lock);
+}
+
 /*
  * Map the buffer_head passed in argument with the iblock-th block of the file
  * represented by inode. If the requested block is not allocated and create is
@@ -27,6 +45,7 @@ static int simplefs_file_get_block(struct inode *inode,
     bool alloc = false;
     int ret = 0, bno;
     uint32_t extent;
+    struct shpage* shpage;
 
     /* If block number exceeds filesize, fail */
     if (iblock >= SIMPLEFS_MAX_BLOCKS_PER_EXTENT * SIMPLEFS_MAX_EXTENTS)
@@ -70,6 +89,13 @@ static int simplefs_file_get_block(struct inode *inode,
 
     /* Map the physical block to to the given buffer_head */
     map_bh(bh_result, sb, bno);
+
+    // Insert block that is about to be read into blkmap
+    shpage = blkmap_insert(bno, bh_result->b_page, 1);
+    // And fix up pointer in the radix tree to be a blkid instead
+    simplefs_fixup_radix_tree_with_blkid(inode->mapping, bno);
+    shpage_unlock(shpage);
+
 
 brelse_index:
     brelse(bh_index);
@@ -203,11 +229,80 @@ end:
     return ret;
 }
 
+struct shpage {
+    atomic_t mode;
+    int bno;
+    struct page *page;
+    // XXX -- acquired when shpage is constructed, released once added to blkmap and radix tree
+	spinlock_t lock;
+    struct h_list_node node;
+};
+
+DECLARE_HASHTABLE(blkmap, 16);
+
+static init_blkmap(void) {
+    hash_init(blkmap);
+}
+
+static struct shpage *blkmap_insert(int bno, struct page *page, int lock) {
+    struct shpage *shpage;
+
+    shpage = kzalloc(sizeof(struct shpage), GFP_KERNEL);
+    BUG_ON(!shpage);
+
+    shpage->bno = bno;
+    shpage->page = page;
+    spinlock_init(&shpage->lock);
+    if (lock)
+        spin_lock(&shpage->irqlock);
+
+    hash_add(blkmap, shpage, key);
+}
+
+static void shpage_unlock(struct shpage *shpage) {
+    spin_unlock(shpage->lock);
+}
+
+static struct shpage *blkmap_find(int bno) {
+    struct shpage *shpage;
+    hash_for_each_possible(blkmap, shpage, node, bno) {
+        if (shpage->bno == bno)
+            return shpage;
+    }
+}
+
+// Called on find_get_entry (page cache hit)
+struct page *simplefs_translate_page_ptr(struct page *blkid) {
+    struct shpage *shpage;
+    int bno;
+
+    bno = (int)(uintptr_t)blkid;
+    shpage = blkmap_find(bno);
+    // Two cases here.
+    if (shpage) {
+        // Case 1: blkid is in blkmap: indicates already mapped in local CN
+        return shpage->page;
+    } else {
+        // Case 2: no page has been allocated on this CN yet;
+        // get a page and fill it from coherent shared memory.
+
+        // Looks like __page_cache_alloc *is* exported from pagemap.c
+        // despite its name.
+        page = __page_cache_alloc(GFP_KERNEL);
+        BUG_ON(!page);
+
+        blkmap_insert(bno, page, 0);
+        // No need to fix up radix tree here. We *got* here because
+        // we found a blkid inside the radix tree.
+    }
+}
+
 const struct address_space_operations simplefs_aops = {
     .readpage = simplefs_readpage,
     .writepage = simplefs_writepage,
     .write_begin = simplefs_write_begin,
     .write_end = simplefs_write_end,
+    .translate_page_ptr = simplefs_translate_page_ptr,
 };
 
 const struct file_operations simplefs_file_ops = {
